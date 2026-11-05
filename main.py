@@ -1,9 +1,9 @@
 """
-Interfaz gráfica principal para LectorFotos.
+Interfaz gráfica corporativa DRS para LectorFotos.
 
 Permite seleccionar una fotografía desde el equipo (o pegar desde el portapapeles),
-visualizarla con resaltado opcional de las zonas detectadas y obtener en un segundo
-recuadro todo el texto identificado mediante OCR.
+visualizarla con resaltado corporativo de las zonas detectadas y obtener en un
+segundo recuadro todo el texto identificado mediante OCR.
 """
 
 from __future__ import annotations
@@ -13,10 +13,19 @@ import threading
 import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 from PIL import Image, ImageDraw, ImageGrab, ImageTk
 
+from brand_assets import (
+    BRAND_DEEP_ACCENT,
+    BRAND_NAVY,
+    BRAND_PRIMARY,
+    BRAND_SLATE,
+    get_drs_ico_path,
+    load_drs_app_icon,
+    load_drs_logo,
+)
 from ocr_engine import (
     DetectedLine,
     OcrExtractionResult,
@@ -25,8 +34,12 @@ from ocr_engine import (
 )
 
 
-def _enable_windows_dpi_awareness() -> None:
-    """Activa escalado nítido (High-DPI) en pantallas modernas de Windows."""
+def _configure_windows_shell_identity() -> None:
+    """Activa High-DPI y registra AppUserModelID propio para mostrar el ícono DRS en la barra de tareas."""
+    try:
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("drs.lectorfotos.ocr.1")
+    except Exception:
+        pass
     try:
         ctypes.windll.shcore.SetProcessDpiAwareness(1)
     except Exception:
@@ -36,19 +49,49 @@ def _enable_windows_dpi_awareness() -> None:
             pass
 
 
-class LectorFotosApp:
-    """Aplicación de escritorio para identificar texto en fotografías."""
+def _hex_to_rgba(hex_color: str, alpha: int = 255) -> Tuple[int, int, int, int]:
+    h = hex_color.lstrip("#")
+    return (int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16), alpha)
 
-    BG_MAIN = "#F3F5F9"
-    BG_CARD = "#FFFFFF"
-    BG_CANVAS = "#1E2430"
-    BORDER_COLOR = "#D8DEE9"
-    ACCENT = "#2563EB"
-    ACCENT_HOVER = "#1D4ED8"
-    TEXT_PRIMARY = "#111827"
-    TEXT_MUTED = "#6B7280"
-    HIGHLIGHT_FILL = (16, 185, 129, 55)
-    HIGHLIGHT_OUTLINE = (16, 185, 129, 235)
+
+def _composite_logo_on_bg(
+    logo_rgba: Image.Image,
+    target_height: int,
+    bg_hex: str,
+    opacity: float = 1.0,
+) -> Image.Image:
+    """Redimensiona el logo DRS con antialiasing LANCZOS y lo compone sobre el color de fondo exacto."""
+    scale = target_height / float(max(1, logo_rgba.height))
+    target_width = max(1, int(round(logo_rgba.width * scale)))
+    resized = logo_rgba.resize((target_width, target_height), Image.Resampling.LANCZOS)
+
+    if opacity < 1.0:
+        r, g, b, a = resized.split()
+        a = a.point(lambda px: int(round(px * opacity)))
+        resized = Image.merge("RGBA", (r, g, b, a))
+
+    bg = Image.new("RGBA", (target_width, target_height), _hex_to_rgba(bg_hex, 255))
+    return Image.alpha_composite(bg, resized).convert("RGB")
+
+
+class LectorFotosApp:
+    """Aplicación de escritorio con identidad corporativa DRS para identificar texto en fotografías."""
+
+    # Paleta Corporativa DRS
+    COLOR_HEADER_BG = BRAND_NAVY          # #0B192C
+    COLOR_CANVAS_BG = BRAND_SLATE         # #10233B
+    COLOR_BRAND = BRAND_PRIMARY           # #2FCEE6
+    COLOR_BRAND_HOVER = "#5CE0F2"
+    COLOR_BRAND_DEEP = BRAND_DEEP_ACCENT  # #0B8499
+    COLOR_WORKSPACE_BG = "#EDF3F8"
+    COLOR_CARD_BG = "#FFFFFF"
+    COLOR_CARD_BORDER = "#D4E1EC"
+    COLOR_TEXT_MAIN = "#0F172A"
+    COLOR_TEXT_MUTED = "#64748B"
+
+    # Resaltado OCR sobre la foto en Cyan DRS
+    HIGHLIGHT_FILL = (47, 206, 230, 52)
+    HIGHLIGHT_OUTLINE = (47, 206, 230, 240)
 
     SUPPORTED_FILETYPES = [
         ("Imágenes soportadas", "*.png *.jpg *.jpeg *.bmp *.webp *.tif *.tiff *.gif"),
@@ -61,224 +104,396 @@ class LectorFotosApp:
 
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
-        self.root.title("Lector de Fotos — Identificador de Texto (OCR)")
-        self.root.geometry("1120x680")
-        self.root.minsize(820, 520)
-        self.root.configure(bg=self.BG_MAIN)
+        self.root.title("DRS  |  Lector de Fotos — Identificador de Texto (OCR)")
+        self.root.geometry("1180x720")
+        self.root.minsize(880, 560)
+        self.root.configure(bg=self.COLOR_WORKSPACE_BG)
 
+        # Cargar recursos gráficos corporativos DRS
+        self._raw_logo = load_drs_logo()
+        self._apply_window_icon()
+
+        # Referencias persistentes para imágenes Tkinter
+        self._header_logo_tk: Optional[ImageTk.PhotoImage] = None
+        self._footer_logo_tk: Optional[ImageTk.PhotoImage] = None
+        self._canvas_watermark_tk: Optional[ImageTk.PhotoImage] = None
+        self._tk_preview_ref: Optional[ImageTk.PhotoImage] = None
+
+        # Estado de negocio
         self.current_image_path: Optional[Path] = None
         self.current_image: Optional[Image.Image] = None
         self.detected_lines: List[DetectedLine] = []
-        self._tk_preview_ref: Optional[ImageTk.PhotoImage] = None
         self._is_processing = False
         self._resize_job: Optional[str] = None
         self._ocr_request_id = 0
 
+        # Variables reactivas UI
         self.enhance_var = tk.BooleanVar(value=False)
         self.highlight_var = tk.BooleanVar(value=True)
-        self.status_var = tk.StringVar(value="Listo — Selecciona una foto para identificar su texto.")
-        self.photo_meta_var = tk.StringVar(value="Ninguna foto cargada")
+        self.status_var = tk.StringVar(value="Sistema listo — Selecciona una fotografía para identificar su texto.")
+        self.photo_meta_var = tk.StringVar(value="Sin imagen seleccionada")
         self.stats_var = tk.StringVar(value="0 palabras  •  0 caracteres")
 
         self._configure_styles()
         self._build_ui()
         self._bind_shortcuts()
 
+    def _apply_window_icon(self) -> None:
+        ico_path = get_drs_ico_path()
+        if ico_path is not None:
+            try:
+                self.root.iconbitmap(default=str(ico_path))
+            except Exception:
+                pass
+        try:
+            icon_img = load_drs_app_icon()
+            self._app_icon_tk = ImageTk.PhotoImage(icon_img)
+            self.root.iconphoto(True, self._app_icon_tk)
+        except Exception:
+            pass
+
     def _configure_styles(self) -> None:
         style = ttk.Style(self.root)
         if "clam" in style.theme_names():
             style.theme_use("clam")
 
-        style.configure("Main.TFrame", background=self.BG_MAIN)
-        style.configure("Card.TFrame", background=self.BG_CARD)
+        style.configure("Workspace.TFrame", background=self.COLOR_WORKSPACE_BG)
+        style.configure("Card.TFrame", background=self.COLOR_CARD_BG)
+        style.configure("Header.TFrame", background=self.COLOR_HEADER_BG)
+
+        # Botón Principal Corporativo DRS (Cyan #2FCEE6 sobre Navy)
         style.configure(
-            "Title.TLabel",
-            background=self.BG_CARD,
-            foreground=self.TEXT_PRIMARY,
-            font=("Segoe UI", 14, "bold"),
-        )
-        style.configure(
-            "Subtitle.TLabel",
-            background=self.BG_CARD,
-            foreground=self.TEXT_MUTED,
-            font=("Segoe UI", 9),
-        )
-        style.configure(
-            "Section.TLabel",
-            background=self.BG_CARD,
-            foreground=self.TEXT_PRIMARY,
-            font=("Segoe UI", 11, "bold"),
-        )
-        style.configure(
-            "Meta.TLabel",
-            background=self.BG_CARD,
-            foreground=self.TEXT_MUTED,
-            font=("Segoe UI", 9),
-        )
-        style.configure(
-            "Status.TLabel",
-            background=self.BG_CARD,
-            foreground=self.TEXT_PRIMARY,
-            font=("Segoe UI", 9),
-        )
-        style.configure(
-            "Primary.TButton",
-            background=self.ACCENT,
-            foreground="#FFFFFF",
+            "BrandPrimary.TButton",
+            background=self.COLOR_BRAND,
+            foreground="#051926",
             borderwidth=0,
             focusthickness=0,
-            padding=(14, 7),
+            padding=(16, 8),
             font=("Segoe UI", 10, "bold"),
         )
         style.map(
-            "Primary.TButton",
-            background=[("active", self.ACCENT_HOVER), ("disabled", "#93C5FD")],
-            foreground=[("disabled", "#F8FAFC")],
+            "BrandPrimary.TButton",
+            background=[("active", self.COLOR_BRAND_HOVER), ("disabled", "#1E4E5F")],
+            foreground=[("disabled", "#7FA6B5")],
         )
+
+        # Botones Secundarios en el Header Oscuro
         style.configure(
-            "Secondary.TButton",
-            background="#EEF2F7",
-            foreground=self.TEXT_PRIMARY,
+            "HeaderGhost.TButton",
+            background="#162B46",
+            foreground="#E2E8F0",
+            bordercolor="#264366",
+            lightcolor="#162B46",
+            darkcolor="#162B46",
             borderwidth=1,
-            relief="flat",
-            padding=(11, 6),
+            focusthickness=0,
+            padding=(12, 7),
             font=("Segoe UI", 9),
         )
         style.map(
-            "Secondary.TButton",
-            background=[("active", "#E2E8F0"), ("disabled", "#F1F5F9")],
+            "HeaderGhost.TButton",
+            background=[("active", "#213E63"), ("disabled", "#102036")],
+            foreground=[("disabled", "#526985")],
+        )
+
+        # Botón de Acción Acento en Tarjeta Clara (Copiar texto)
+        style.configure(
+            "CardAccent.TButton",
+            background="#E6FAFD",
+            foreground="#075E6E",
+            bordercolor="#8BE4F2",
+            lightcolor="#E6FAFD",
+            darkcolor="#E6FAFD",
+            borderwidth=1,
+            focusthickness=0,
+            padding=(13, 6),
+            font=("Segoe UI", 9, "bold"),
+        )
+        style.map(
+            "CardAccent.TButton",
+            background=[("active", "#CCF4FA"), ("disabled", "#F1F5F9")],
             foreground=[("disabled", "#94A3B8")],
         )
+
+        # Botones Secundarios en Tarjeta Clara
         style.configure(
-            "Card.TCheckbutton",
-            background=self.BG_CARD,
-            foreground=self.TEXT_PRIMARY,
+            "CardSecondary.TButton",
+            background="#F1F5F9",
+            foreground=self.COLOR_TEXT_MAIN,
+            bordercolor="#CBD5E1",
+            lightcolor="#F1F5F9",
+            darkcolor="#F1F5F9",
+            borderwidth=1,
+            focusthickness=0,
+            padding=(12, 6),
             font=("Segoe UI", 9),
         )
-        style.map("Card.TCheckbutton", background=[("active", self.BG_CARD)])
+        style.map(
+            "CardSecondary.TButton",
+            background=[("active", "#E2E8F0"), ("disabled", "#F8FAFC")],
+            foreground=[("disabled", "#94A3B8")],
+        )
+
+        # Checkbuttons en la barra de opciones
         style.configure(
-            "Accent.Horizontal.TProgressbar",
-            troughcolor="#E5E7EB",
-            background=self.ACCENT,
-            bordercolor="#E5E7EB",
-            lightcolor=self.ACCENT,
-            darkcolor=self.ACCENT,
+            "Toolbar.TCheckbutton",
+            background="#FFFFFF",
+            foreground=self.COLOR_TEXT_MAIN,
+            focusthickness=0,
+            font=("Segoe UI", 9),
+        )
+        style.map("Toolbar.TCheckbutton", background=[("active", "#FFFFFF")])
+
+        # Barra de progreso Cyan DRS
+        style.configure(
+            "DRS.Horizontal.TProgressbar",
+            troughcolor="#E2E8F0",
+            background=self.COLOR_BRAND,
+            bordercolor="#E2E8F0",
+            lightcolor=self.COLOR_BRAND,
+            darkcolor=self.COLOR_BRAND,
         )
 
     def _build_ui(self) -> None:
-        # Barra superior de herramientas
-        header_border = tk.Frame(self.root, bg=self.BORDER_COLOR)
-        header_border.pack(fill=tk.X, side=tk.TOP)
+        # ==================================================================
+        # 1. HEADER CORPORATIVO DRS (#0B192C + línea inferior #2FCEE6)
+        # ==================================================================
+        header_wrap = tk.Frame(self.root, bg=self.COLOR_HEADER_BG)
+        header_wrap.pack(fill=tk.X, side=tk.TOP)
 
-        header = ttk.Frame(header_border, style="Card.TFrame", padding=(18, 12))
-        header.pack(fill=tk.X, side=tk.TOP, pady=(0, 1))
+        header_inner = tk.Frame(header_wrap, bg=self.COLOR_HEADER_BG, padx=22, pady=13)
+        header_inner.pack(fill=tk.X, side=tk.TOP)
 
-        title_box = ttk.Frame(header, style="Card.TFrame")
-        title_box.pack(side=tk.LEFT)
-        ttk.Label(title_box, text="Lector de Fotos", style="Title.TLabel").pack(anchor="w")
-        ttk.Label(
-            title_box,
-            text="Selecciona una imagen para detectar y extraer su texto automáticamente",
-            style="Subtitle.TLabel",
-        ).pack(anchor="w")
+        # Franja luminosa corporativa DRS de 3 px
+        tk.Frame(header_wrap, bg=self.COLOR_BRAND, height=3).pack(fill=tk.X, side=tk.BOTTOM)
 
-        controls = ttk.Frame(header, style="Card.TFrame")
-        controls.pack(side=tk.RIGHT)
+        # Bloque Izquierdo: Logo DRS + Separador + Título
+        brand_left = tk.Frame(header_inner, bg=self.COLOR_HEADER_BG)
+        brand_left.pack(side=tk.LEFT)
+
+        header_logo_img = _composite_logo_on_bg(self._raw_logo, target_height=42, bg_hex=self.COLOR_HEADER_BG)
+        self._header_logo_tk = ImageTk.PhotoImage(header_logo_img)
+        lbl_logo = tk.Label(brand_left, image=self._header_logo_tk, bg=self.COLOR_HEADER_BG, bd=0)
+        lbl_logo.pack(side=tk.LEFT, padx=(0, 16))
+
+        # Línea divisoria vertical cyan/navy
+        tk.Frame(brand_left, bg="#234369", width=1, height=38).pack(side=tk.LEFT, padx=(0, 16))
+
+        title_stack = tk.Frame(brand_left, bg=self.COLOR_HEADER_BG)
+        title_stack.pack(side=tk.LEFT)
+
+        title_row = tk.Frame(title_stack, bg=self.COLOR_HEADER_BG)
+        title_row.pack(anchor="w")
+        tk.Label(
+            title_row,
+            text="Lector de Fotos",
+            bg=self.COLOR_HEADER_BG,
+            fg="#FFFFFF",
+            font=("Segoe UI", 15, "bold"),
+        ).pack(side=tk.LEFT)
+
+        badge = tk.Label(
+            title_row,
+            text=" OCR ",
+            bg="#123854",
+            fg=self.COLOR_BRAND,
+            font=("Segoe UI", 8, "bold"),
+            padx=5,
+            pady=1,
+        )
+        badge.pack(side=tk.LEFT, padx=(9, 0), pady=(2, 0))
+
+        tk.Label(
+            title_stack,
+            text="Sistema inteligente de identificación y extracción de texto en imágenes",
+            bg=self.COLOR_HEADER_BG,
+            fg="#94A3B8",
+            font=("Segoe UI", 9),
+        ).pack(anchor="w", pady=(1, 0))
+
+        # Bloque Derecho: Botones principales de captura/imagen
+        header_actions = tk.Frame(header_inner, bg=self.COLOR_HEADER_BG)
+        header_actions.pack(side=tk.RIGHT)
 
         self.btn_select = ttk.Button(
-            controls,
-            text="📂 Seleccionar foto...",
-            style="Primary.TButton",
+            header_actions,
+            text="📂  Seleccionar foto...",
+            style="BrandPrimary.TButton",
             command=self.select_photo,
         )
         self.btn_select.pack(side=tk.LEFT, padx=(0, 8))
 
         self.btn_paste = ttk.Button(
-            controls,
-            text="📋 Pegar imagen",
-            style="Secondary.TButton",
+            header_actions,
+            text="📋 Pegar captura",
+            style="HeaderGhost.TButton",
             command=self.paste_from_clipboard,
         )
-        self.btn_paste.pack(side=tk.LEFT, padx=(0, 8))
+        self.btn_paste.pack(side=tk.LEFT, padx=(0, 6))
 
         self.btn_rotate = ttk.Button(
-            controls,
+            header_actions,
             text="↻ Rotar 90°",
-            style="Secondary.TButton",
+            style="HeaderGhost.TButton",
             command=self.rotate_image,
             state=tk.DISABLED,
         )
-        self.btn_rotate.pack(side=tk.LEFT, padx=(0, 8))
+        self.btn_rotate.pack(side=tk.LEFT, padx=(0, 6))
 
         self.btn_reanalyze = ttk.Button(
-            controls,
+            header_actions,
             text="🔍 Re-analizar",
-            style="Secondary.TButton",
+            style="HeaderGhost.TButton",
             command=self.run_ocr_on_current,
             state=tk.DISABLED,
         )
-        self.btn_reanalyze.pack(side=tk.LEFT, padx=(0, 12))
+        self.btn_reanalyze.pack(side=tk.LEFT)
 
-        opts_box = ttk.Frame(controls, style="Card.TFrame")
-        opts_box.pack(side=tk.LEFT)
+        # ==================================================================
+        # 2. SUB-BARRA DE AJUSTES VISUALES Y PREPROCESAMIENTO
+        # ==================================================================
+        subbar_border = tk.Frame(self.root, bg=self.COLOR_CARD_BORDER)
+        subbar_border.pack(fill=tk.X, side=tk.TOP)
+
+        subbar = tk.Frame(subbar_border, bg="#FFFFFF", padx=22, pady=7)
+        subbar.pack(fill=tk.X, side=tk.TOP, pady=(0, 1))
+
+        tk.Label(
+            subbar,
+            text="OPCIONES DE LECTURA:",
+            bg="#FFFFFF",
+            fg=self.COLOR_BRAND_DEEP,
+            font=("Segoe UI", 8, "bold"),
+        ).pack(side=tk.LEFT, padx=(0, 12))
+
         ttk.Checkbutton(
-            opts_box,
-            text="Mejorar contraste",
+            subbar,
+            text="Mejorar contraste (ideal para documentos oscuros o con sombras)",
             variable=self.enhance_var,
-            style="Card.TCheckbutton",
+            style="Toolbar.TCheckbutton",
             command=self._on_enhance_toggled,
-        ).pack(anchor="w")
-        ttk.Checkbutton(
-            opts_box,
-            text="Resaltar zonas de texto",
-            variable=self.highlight_var,
-            style="Card.TCheckbutton",
-            command=self._render_canvas_preview,
-        ).pack(anchor="w")
+        ).pack(side=tk.LEFT, padx=(0, 20))
 
-        # Barra de estado inferior
-        footer_border = tk.Frame(self.root, bg=self.BORDER_COLOR)
+        ttk.Checkbutton(
+            subbar,
+            text="Resaltar texto detectado sobre la fotografía",
+            variable=self.highlight_var,
+            style="Toolbar.TCheckbutton",
+            command=self._render_canvas_preview,
+        ).pack(side=tk.LEFT)
+
+        tk.Label(
+            subbar,
+            text="Atajos: Ctrl+O abrir  •  Ctrl+V pegar captura  •  Ctrl+S guardar",
+            bg="#FFFFFF",
+            fg=self.COLOR_TEXT_MUTED,
+            font=("Segoe UI", 8),
+        ).pack(side=tk.RIGHT)
+
+        # ==================================================================
+        # 3. FOOTER CORPORATIVO DRS
+        # ==================================================================
+        footer_border = tk.Frame(self.root, bg=self.COLOR_CARD_BORDER)
         footer_border.pack(fill=tk.X, side=tk.BOTTOM)
 
-        footer = ttk.Frame(footer_border, style="Card.TFrame", padding=(16, 8))
+        footer = tk.Frame(footer_border, bg="#FFFFFF", padx=20, pady=8)
         footer.pack(fill=tk.X, side=tk.TOP, pady=(1, 0))
 
-        ttk.Label(footer, textvariable=self.status_var, style="Status.TLabel").pack(side=tk.LEFT)
+        self.status_dot = tk.Label(
+            footer,
+            text="●",
+            bg="#FFFFFF",
+            fg=self.COLOR_BRAND_DEEP,
+            font=("Segoe UI", 10),
+        )
+        self.status_dot.pack(side=tk.LEFT, padx=(0, 6))
+
+        tk.Label(
+            footer,
+            textvariable=self.status_var,
+            bg="#FFFFFF",
+            fg=self.COLOR_TEXT_MAIN,
+            font=("Segoe UI", 9),
+        ).pack(side=tk.LEFT)
+
+        # Sello DRS a la derecha del footer
+        footer_brand = tk.Frame(footer, bg="#FFFFFF")
+        footer_brand.pack(side=tk.RIGHT)
+
+        footer_logo_img = _composite_logo_on_bg(self._raw_logo, target_height=18, bg_hex="#FFFFFF")
+        self._footer_logo_tk = ImageTk.PhotoImage(footer_logo_img)
+        tk.Label(footer_brand, image=self._footer_logo_tk, bg="#FFFFFF", bd=0).pack(side=tk.LEFT, padx=(0, 6))
+        tk.Label(
+            footer_brand,
+            text="DRS  •  Extractor OCR",
+            bg="#FFFFFF",
+            fg=self.COLOR_TEXT_MUTED,
+            font=("Segoe UI", 8, "bold"),
+        ).pack(side=tk.LEFT)
 
         self.progress = ttk.Progressbar(
             footer,
-            style="Accent.Horizontal.TProgressbar",
+            style="DRS.Horizontal.TProgressbar",
             mode="indeterminate",
-            length=170,
+            length=160,
         )
 
-        # Contenedor central dividido en dos recuadros redimensionables
-        body = ttk.Frame(self.root, style="Main.TFrame", padding=(16, 14))
+        # ==================================================================
+        # 4. ÁREA PRINCIPAL DIVIDIDA EN DOS RECUADROS
+        # ==================================================================
+        body = ttk.Frame(self.root, style="Workspace.TFrame", padding=(18, 14))
         body.pack(fill=tk.BOTH, expand=True)
 
         paned = tk.PanedWindow(
             body,
             orient=tk.HORIZONTAL,
-            sashwidth=10,
-            bg=self.BG_MAIN,
+            sashwidth=12,
+            bg=self.COLOR_WORKSPACE_BG,
             bd=0,
             opaqueresize=True,
         )
         paned.pack(fill=tk.BOTH, expand=True)
 
-        # --- RECUADRO IZQUIERDO: FOTO SELECCIONADA ---
-        left_outer = tk.Frame(paned, bg=self.BORDER_COLOR, padx=1, pady=1)
+        # --- RECUADRO 1: FOTOGRAFÍA SELECCIONADA ---
+        left_outer = tk.Frame(paned, bg=self.COLOR_CARD_BORDER, padx=1, pady=1)
+        left_top_accent = tk.Frame(left_outer, bg=self.COLOR_BRAND, height=3)
+        left_top_accent.pack(fill=tk.X, side=tk.TOP)
+
         left_card = ttk.Frame(left_outer, style="Card.TFrame", padding=14)
         left_card.pack(fill=tk.BOTH, expand=True)
 
-        left_header = ttk.Frame(left_card, style="Card.TFrame")
+        left_header = tk.Frame(left_card, bg=self.COLOR_CARD_BG)
         left_header.pack(fill=tk.X, pady=(0, 10))
-        ttk.Label(left_header, text="1. Fotografía seleccionada", style="Section.TLabel").pack(side=tk.LEFT)
-        ttk.Label(left_header, textvariable=self.photo_meta_var, style="Meta.TLabel").pack(side=tk.RIGHT)
+
+        tk.Label(
+            left_header,
+            text="01",
+            bg="#E6FAFD",
+            fg=self.COLOR_BRAND_DEEP,
+            font=("Segoe UI", 9, "bold"),
+            padx=6,
+            pady=2,
+        ).pack(side=tk.LEFT, padx=(0, 8))
+
+        tk.Label(
+            left_header,
+            text="Fotografía seleccionada",
+            bg=self.COLOR_CARD_BG,
+            fg=self.COLOR_TEXT_MAIN,
+            font=("Segoe UI", 11, "bold"),
+        ).pack(side=tk.LEFT)
+
+        tk.Label(
+            left_header,
+            textvariable=self.photo_meta_var,
+            bg=self.COLOR_CARD_BG,
+            fg=self.COLOR_TEXT_MUTED,
+            font=("Segoe UI", 9),
+        ).pack(side=tk.RIGHT)
 
         self.canvas = tk.Canvas(
             left_card,
-            bg=self.BG_CANVAS,
+            bg=self.COLOR_CANVAS_BG,
             highlightthickness=1,
             highlightbackground="#CBD5E1",
             cursor="hand2",
@@ -287,20 +502,58 @@ class LectorFotosApp:
         self.canvas.bind("<Configure>", self._on_canvas_configure)
         self.canvas.bind("<Button-1>", self._on_canvas_click)
 
-        # --- RECUADRO DERECHO: TEXTO IDENTIFICADO ---
-        right_outer = tk.Frame(paned, bg=self.BORDER_COLOR, padx=1, pady=1)
+        # Preparar emblema DRS para el estado vacío del lienzo
+        wm_img = _composite_logo_on_bg(
+            self._raw_logo,
+            target_height=56,
+            bg_hex=self.COLOR_CANVAS_BG,
+            opacity=0.92,
+        )
+        self._canvas_watermark_tk = ImageTk.PhotoImage(wm_img)
+
+        # --- RECUADRO 2: TEXTO IDENTIFICADO EN LA FOTO ---
+        right_outer = tk.Frame(paned, bg=self.COLOR_CARD_BORDER, padx=1, pady=1)
+        right_top_accent = tk.Frame(right_outer, bg=self.COLOR_BRAND, height=3)
+        right_top_accent.pack(fill=tk.X, side=tk.TOP)
+
         right_card = ttk.Frame(right_outer, style="Card.TFrame", padding=14)
         right_card.pack(fill=tk.BOTH, expand=True)
 
-        right_header = ttk.Frame(right_card, style="Card.TFrame")
+        right_header = tk.Frame(right_card, bg=self.COLOR_CARD_BG)
         right_header.pack(fill=tk.X, pady=(0, 10))
-        ttk.Label(right_header, text="2. Texto identificado en la foto", style="Section.TLabel").pack(side=tk.LEFT)
-        ttk.Label(right_header, textvariable=self.stats_var, style="Meta.TLabel").pack(side=tk.RIGHT)
+
+        tk.Label(
+            right_header,
+            text="02",
+            bg="#E6FAFD",
+            fg=self.COLOR_BRAND_DEEP,
+            font=("Segoe UI", 9, "bold"),
+            padx=6,
+            pady=2,
+        ).pack(side=tk.LEFT, padx=(0, 8))
+
+        tk.Label(
+            right_header,
+            text="Texto identificado en la foto",
+            bg=self.COLOR_CARD_BG,
+            fg=self.COLOR_TEXT_MAIN,
+            font=("Segoe UI", 11, "bold"),
+        ).pack(side=tk.LEFT)
+
+        tk.Label(
+            right_header,
+            textvariable=self.stats_var,
+            bg="#F1F5F9",
+            fg=self.COLOR_TEXT_MUTED,
+            font=("Segoe UI", 8, "bold"),
+            padx=8,
+            pady=3,
+        ).pack(side=tk.RIGHT)
 
         text_container = tk.Frame(right_card, bg="#CBD5E1", padx=1, pady=1)
         text_container.pack(fill=tk.BOTH, expand=True)
 
-        text_inner = tk.Frame(text_container, bg="#F8FAFC")
+        text_inner = tk.Frame(text_container, bg="#F8FBFD")
         text_inner.pack(fill=tk.BOTH, expand=True)
 
         scrollbar = ttk.Scrollbar(text_inner, orient=tk.VERTICAL)
@@ -310,14 +563,14 @@ class LectorFotosApp:
             text_inner,
             wrap=tk.WORD,
             font=("Segoe UI", 11),
-            bg="#F8FAFC",
-            fg=self.TEXT_PRIMARY,
-            insertbackground=self.TEXT_PRIMARY,
-            selectbackground="#BFDBFE",
-            selectforeground=self.TEXT_PRIMARY,
+            bg="#F8FBFD",
+            fg=self.COLOR_TEXT_MAIN,
+            insertbackground=self.COLOR_BRAND_DEEP,
+            selectbackground="#A5F0FC",
+            selectforeground=self.COLOR_TEXT_MAIN,
             relief=tk.FLAT,
-            padx=14,
-            pady=12,
+            padx=16,
+            pady=14,
             spacing1=2,
             spacing3=4,
             undo=True,
@@ -328,35 +581,35 @@ class LectorFotosApp:
         self.text_box.bind("<<Modified>>", self._on_text_modified)
 
         # Acciones del recuadro de texto
-        right_actions = ttk.Frame(right_card, style="Card.TFrame")
-        right_actions.pack(fill=tk.X, pady=(10, 0))
+        right_actions = tk.Frame(right_card, bg=self.COLOR_CARD_BG)
+        right_actions.pack(fill=tk.X, pady=(12, 0))
 
         self.btn_copy = ttk.Button(
             right_actions,
             text="📋 Copiar texto",
-            style="Secondary.TButton",
+            style="CardAccent.TButton",
             command=self.copy_text,
         )
         self.btn_copy.pack(side=tk.LEFT, padx=(0, 8))
 
         self.btn_save = ttk.Button(
             right_actions,
-            text="💾 Guardar como .txt",
-            style="Secondary.TButton",
+            text="💾 Guardar .txt",
+            style="CardSecondary.TButton",
             command=self.save_text_file,
         )
         self.btn_save.pack(side=tk.LEFT, padx=(0, 8))
 
         self.btn_clear = ttk.Button(
             right_actions,
-            text="🧹 Limpiar",
-            style="Secondary.TButton",
+            text="🧹 Limpiar vista",
+            style="CardSecondary.TButton",
             command=self.clear_all,
         )
         self.btn_clear.pack(side=tk.RIGHT)
 
-        paned.add(left_outer, minsize=340, stretch="always")
-        paned.add(right_outer, minsize=340, stretch="always")
+        paned.add(left_outer, minsize=380, stretch="always")
+        paned.add(right_outer, minsize=380, stretch="always")
 
         self._set_placeholder_text()
 
@@ -365,7 +618,6 @@ class LectorFotosApp:
         self.root.bind("<Control-O>", lambda _e: self.select_photo())
         self.root.bind("<Control-s>", lambda _e: self.save_text_file())
         self.root.bind("<Control-S>", lambda _e: self.save_text_file())
-        # Permitir pegar imagen desde portapapeles con Ctrl+V cuando el foco no está editando texto
         self.root.bind("<Control-v>", self._handle_ctrl_v)
         self.root.bind("<Control-V>", self._handle_ctrl_v)
 
@@ -394,7 +646,7 @@ class LectorFotosApp:
 
         file_path = filedialog.askopenfilename(
             parent=self.root,
-            title="Seleccionar fotografía para leer texto",
+            title="DRS Lector de Fotos — Seleccionar imagen",
             filetypes=self.SUPPORTED_FILETYPES,
         )
         if not file_path:
@@ -405,8 +657,8 @@ class LectorFotosApp:
             img = load_oriented_image(path_obj)
         except Exception as exc:
             messagebox.showerror(
-                "No se pudo abrir la imagen",
-                f"El archivo seleccionado no pudo abrirse como imagen válida:\n\n{exc}",
+                "Archivo no válido",
+                f"No se pudo abrir la imagen seleccionada:\n\n{exc}",
                 parent=self.root,
             )
             return
@@ -436,7 +688,7 @@ class LectorFotosApp:
             else:
                 img = clip.convert("RGB")
             self.current_image_path = None
-            self._set_loaded_image(img, source_label="Portapapeles")
+            self._set_loaded_image(img, source_label="Captura pegada")
         elif isinstance(clip, list) and clip:
             first_file = Path(clip[0])
             if first_file.is_file():
@@ -449,13 +701,13 @@ class LectorFotosApp:
                     pass
             messagebox.showinfo(
                 "Sin imagen en el portapapeles",
-                "El portapapeles no contiene una imagen compatible en este momento.",
+                "El portapapeles no contiene una imagen compatible.",
                 parent=self.root,
             )
         else:
             messagebox.showinfo(
                 "Sin imagen en el portapapeles",
-                "Copia primero una foto o captura de pantalla (por ejemplo con Win + Shift + S) y vuelve a pulsar «Pegar imagen».",
+                "Copia primero una foto o captura de pantalla (por ejemplo con Win + Shift + S) y pulsa «Pegar captura».",
                 parent=self.root,
             )
 
@@ -492,34 +744,37 @@ class LectorFotosApp:
 
         if self.current_image is None:
             cx, cy = cw // 2, ch // 2
-            pad_w = min(380, max(220, cw - 60))
-            pad_h = 150
+            pad_w = min(410, max(240, cw - 64))
+            pad_h = 215
             self.canvas.create_rectangle(
                 cx - pad_w // 2,
                 cy - pad_h // 2,
                 cx + pad_w // 2,
                 cy + pad_h // 2,
-                outline="#475569",
-                dash=(6, 4),
+                outline="#23577A",
+                dash=(7, 5),
                 width=2,
             )
+            if self._canvas_watermark_tk is not None:
+                self.canvas.create_image(cx, cy - 46, image=self._canvas_watermark_tk, anchor=tk.CENTER)
+
             self.canvas.create_text(
                 cx,
-                cy - 22,
-                text="📷  Haz clic aquí para elegir una foto",
-                fill="#F8FAFC",
-                font=("Segoe UI", 12, "bold"),
+                cy + 14,
+                text="Haz clic aquí para seleccionar una fotografía",
+                fill="#FFFFFF",
+                font=("Segoe UI", 11, "bold"),
                 justify=tk.CENTER,
-                width=pad_w - 24,
+                width=pad_w - 28,
             )
             self.canvas.create_text(
                 cx,
-                cy + 24,
-                text="Formatos compatibles: JPG, PNG, WEBP, BMP, TIFF\nTambién puedes pegar una captura con Ctrl + V",
-                fill="#94A3B8",
+                cy + 56,
+                text="Compatible con JPG, PNG, WEBP, BMP y TIFF\nTambién puedes pegar una imagen directamente con Ctrl + V",
+                fill="#8BA3BE",
                 font=("Segoe UI", 9),
                 justify=tk.CENTER,
-                width=pad_w - 24,
+                width=pad_w - 28,
             )
             return
 
@@ -568,7 +823,7 @@ class LectorFotosApp:
         img_copy = self.current_image.copy()
         enhance = self.enhance_var.get()
 
-        self._set_processing_state(True, "Identificando texto en la fotografía, espera un momento...")
+        self._set_processing_state(True, "Analizando fotografía e identificando texto...")
 
         worker = threading.Thread(
             target=self._ocr_worker,
@@ -594,28 +849,31 @@ class LectorFotosApp:
 
         if result.text:
             self._set_result_text(result.text)
+            self.status_dot.configure(fg="#10B981")
             self.status_var.set(
-                f"Texto identificado con {result.engine_name} ({result.language}) — "
-                f"{len(result.lines) or len(result.text.splitlines())} líneas encontradas."
+                f"Lectura completada ({result.engine_name} • {result.language}) — "
+                f"{len(result.lines) or len(result.text.splitlines())} líneas identificadas."
             )
         else:
             self._set_result_text("")
             self.text_box.insert(
                 "1.0",
-                "(No se identificó texto legible en esta fotografía.\n"
-                "Prueba activando «Mejorar contraste» o rotando la imagen si está girada.)",
+                "(No se detectó texto legible en esta fotografía.\n"
+                "Sugerencia: activa «Mejorar contraste» en la barra superior o rota la imagen si está orientada de lado.)",
             )
             self.text_box.tag_add("muted", "1.0", tk.END)
-            self.text_box.tag_configure("muted", foreground=self.TEXT_MUTED, font=("Segoe UI", 10, "italic"))
+            self.text_box.tag_configure("muted", foreground=self.COLOR_TEXT_MUTED, font=("Segoe UI", 10, "italic"))
             self.stats_var.set("0 palabras  •  0 caracteres")
-            self.status_var.set("Análisis finalizado — No se detectó texto en la imagen.")
+            self.status_dot.configure(fg="#F59E0B")
+            self.status_var.set("Análisis finalizado — No se identificó texto en la imagen.")
 
     def _on_ocr_error(self, req_id: int, error_msg: str) -> None:
         if req_id != self._ocr_request_id:
             return
 
         self._set_processing_state(False)
-        self.status_var.set("Ocurrió un error al analizar la imagen.")
+        self.status_dot.configure(fg="#EF4444")
+        self.status_var.set("Error al procesar la imagen.")
         messagebox.showerror(
             "Error en el reconocimiento de texto",
             f"No fue posible completar la lectura de la imagen:\n\n{error_msg}",
@@ -628,11 +886,12 @@ class LectorFotosApp:
             self.status_var.set(message)
 
         if active:
+            self.status_dot.configure(fg=self.COLOR_BRAND)
             self.btn_select.configure(state=tk.DISABLED)
             self.btn_paste.configure(state=tk.DISABLED)
             self.btn_rotate.configure(state=tk.DISABLED)
             self.btn_reanalyze.configure(state=tk.DISABLED)
-            self.progress.pack(side=tk.RIGHT, padx=(10, 0))
+            self.progress.pack(side=tk.RIGHT, padx=(12, 16))
             self.progress.start(12)
         else:
             self.progress.stop()
@@ -651,10 +910,10 @@ class LectorFotosApp:
         self.text_box.delete("1.0", tk.END)
         self.text_box.insert(
             "1.0",
-            "Aquí aparecerá todo el texto identificado cuando selecciones una foto...",
+            "El texto identificado en tu fotografía se mostrará aquí automáticamente...",
         )
         self.text_box.tag_add("placeholder", "1.0", tk.END)
-        self.text_box.tag_configure("placeholder", foreground=self.TEXT_MUTED, font=("Segoe UI", 10, "italic"))
+        self.text_box.tag_configure("placeholder", foreground=self.COLOR_TEXT_MUTED, font=("Segoe UI", 10, "italic"))
         self.text_box.edit_modified(False)
         self.stats_var.set("0 palabras  •  0 caracteres")
 
@@ -686,11 +945,12 @@ class LectorFotosApp:
     def copy_text(self) -> None:
         content = self._get_clean_text()
         if not content:
-            self.status_var.set("No hay texto para copiar todavía.")
+            self.status_var.set("Aún no hay texto identificado para copiar.")
             return
         self.root.clipboard_clear()
         self.root.clipboard_append(content)
         self.root.update_idletasks()
+        self.status_dot.configure(fg="#10B981")
         self.status_var.set("✔ Texto copiado al portapapeles.")
 
     def save_text_file(self) -> None:
@@ -704,13 +964,13 @@ class LectorFotosApp:
             return
 
         default_name = (
-            f"{self.current_image_path.stem}_texto.txt"
+            f"{self.current_image_path.stem}_DRS_OCR.txt"
             if self.current_image_path
-            else "texto_extraido.txt"
+            else "texto_DRS_OCR.txt"
         )
         out_path = filedialog.asksaveasfilename(
             parent=self.root,
-            title="Guardar texto extraído",
+            title="DRS — Guardar texto extraído",
             initialfile=default_name,
             defaultextension=".txt",
             filetypes=[("Archivo de texto UTF-8", "*.txt"), ("Todos los archivos", "*.*")],
@@ -720,11 +980,12 @@ class LectorFotosApp:
 
         try:
             Path(out_path).write_text(content, encoding="utf-8")
-            self.status_var.set(f"✔ Texto guardado en: {Path(out_path).name}")
+            self.status_dot.configure(fg="#10B981")
+            self.status_var.set(f"✔ Archivo guardado correctamente: {Path(out_path).name}")
         except Exception as exc:
             messagebox.showerror(
                 "Error al guardar",
-                f"No se pudo guardar el archivo:\n{exc}",
+                f"No se pudo escribir el archivo:\n{exc}",
                 parent=self.root,
             )
 
@@ -739,14 +1000,15 @@ class LectorFotosApp:
         self.canvas.configure(cursor="hand2")
         self.btn_rotate.configure(state=tk.DISABLED)
         self.btn_reanalyze.configure(state=tk.DISABLED)
-        self.photo_meta_var.set("Ninguna foto cargada")
+        self.photo_meta_var.set("Sin imagen seleccionada")
         self._render_canvas_preview()
         self._set_placeholder_text()
-        self.status_var.set("Listo — Selecciona una foto para identificar su texto.")
+        self.status_dot.configure(fg=self.COLOR_BRAND_DEEP)
+        self.status_var.set("Sistema listo — Selecciona una fotografía para identificar su texto.")
 
 
 def main() -> None:
-    _enable_windows_dpi_awareness()
+    _configure_windows_shell_identity()
     root = tk.Tk()
     LectorFotosApp(root)
     root.mainloop()

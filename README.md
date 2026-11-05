@@ -1,11 +1,11 @@
-# LectorFotos — Extractor de Texto en Imágenes (OCR)
+# DRS | LectorFotos — Extractor Inteligente de Texto (OCR)
 
-Aplicación de escritorio en Python con interfaz gráfica (`tkinter` + `Pillow`) que permite seleccionar fotografías o pegar capturas desde el portapapeles e identificar automáticamente el texto contenido en ellas.
+Aplicación de escritorio corporativa **DRS** desarrollada en Python (`tkinter` + `Pillow`) que permite seleccionar fotografías o pegar capturas desde el portapapeles e identificar automáticamente todo el texto contenido en ellas.
 
 ## Características
 
+- **Identidad corporativa DRS**: encabezado ejecutivo `#0B192C` con logotipo oficial **DRS** (`#2FCEE6`), ícono personalizado en ventana y barra de tareas de Windows, marca de agua en el visor y resaltado OCR en cyan corporativo.
 - **Dos paneles interactivos**: vista previa adaptable de la fotografía a la izquierda y texto extraído editable a la derecha.
-- **Resaltado visual**: dibuja recuadros sobre las líneas de texto detectadas directamente en la imagen.
 - **OCR sin dependencias pesadas**: utiliza el motor nativo de Windows (`Windows.Media.Ocr`) y detecta automáticamente **Tesseract OCR** si está instalado en el sistema.
 - **Herramientas integradas**: rotación de imagen en 90°, mejora opcional de contraste, pegado rápido desde el portapapeles (`Ctrl + V`), copiado con un clic y exportación a `.txt`.
 
